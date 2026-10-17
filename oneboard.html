@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>OneBoard</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f4f4f0; font: 14px system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+  #bar { position: fixed; top: 0; left: 0; right: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 8px; background: #1d2026; color: #e8e8ea; }
+  button, select { font: inherit; background: #2c3038; color: inherit; border: 1px solid #3b404a; border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+  button.on { background: #5b7cff; border-color: #5b7cff; }
+  #pal { display: flex; flex-wrap: wrap; gap: 2px; max-width: 330px; }
+  .sw { width: 18px; height: 18px; border-radius: 3px; border: 2px solid transparent; cursor: pointer; box-sizing: border-box; }
+  .sw.on { border-color: #fff; outline: 1px solid #000; }
+  #info { margin-left: auto; opacity: .7; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button data-tool="pencil" class="on">Pencil</button>
+  <button data-tool="eraser">Eraser</button>
+  <button data-tool="pick">Pick color</button>
+  <button data-tool="hand">Move</button>
+  <select id="brush"><option value="1">Size 1</option><option value="2">Size 2</option><option value="4">Size 4</option><option value="8">Size 8</option></select>
+  <div id="pal"></div>
+  <button id="zin">+</button><button id="zout">-</button>
+  <span id="info"></span>
+</div>
+<canvas id="cv"></canvas>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+// ---- Paste the same values you use in your ONEFILE Supabase file ----
+const SUPABASE_URL = "PASTE_YOUR_SUPABASE_URL";
+const SUPABASE_KEY = "PASTE_YOUR_ANON_KEY";
+// ---------------------------------------------------------------------
+
+const CH = 64, SIZE = 128, N = CH * SIZE;
+const PAL = [null, "#000000", "#ffffff", "#7f7f7f", "#c3c3c3", "#880015", "#ed1c24", "#ff7f27", "#ffc90e", "#fff200", "#b5e61d", "#22b14c", "#00a2e8", "#3f48cc", "#a349a4", "#ffaec9", "#b97a57", "#5a3921", "#ff5a5a", "#ffd6a5", "#fdffb6", "#caffbf", "#9bf6ff", "#a0c4ff", "#bdb2ff", "#ffc6ff", "#1b4332", "#0b3954", "#3d2c8d", "#6b0f1a", "#f4a261", "#264653"];
+const RGB = PAL.map(h => h ? [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)) : [244, 244, 240]);
+const cv = document.getElementById("cv"), g = cv.getContext("2d"), info = document.getElementById("info");
+
+let W, H, z = 12, ox = N / 2 - 40, oy = N / 2 - 25;
+let tool = "pencil", color = 6, brush = 1, space = false, drag = null, last = null, raf = 0, askT, status = "connecting", pos = "";
+const store = new Map(), asked = new Set(), pending = [], mine = new Map();
+
+function showInfo() { info.textContent = status + (pos ? "  " + pos : ""); }
+function setStatus(s) { status = s; showInfo(); }
+
+if (SUPABASE_URL.startsWith("PASTE")) { setStatus("add your Supabase URL and key at the top of the file"); throw new Error("Supabase not configured"); }
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const room = sb.channel("oneboard", { config: { broadcast: { self: false } } });
+
+function chunk(cx, cy) {
+  const k = cx + "," + cy;
+  let c = store.get(k);
+  if (!c) {
+    c = { a: new Uint8Array(CH * CH), cv: document.createElement("canvas"), dirty: true };
+    c.cv.width = c.cv.height = CH;
+    store.set(k, c);
+  }
+  return c;
+}
+function paint(c) {
+  const x = c.cv.getContext("2d"), im = x.createImageData(CH, CH);
+  for (let i = 0; i < CH * CH; i++) {
+    const r = RGB[c.a[i]] || RGB[0];
+    im.data.set([r[0], r[1], r[2], 255], i * 4);
+  }
+  x.putImageData(im, 0, 0);
+  c.dirty = false;
+}
+function setCell(x, y, v) {
+  if (x < 0 || y < 0 || x >= N || y >= N || !(v >= 0 && v < PAL.length)) return;
+  const c = chunk(x >> 6, y >> 6);
+  c.a[(y & 63) * CH + (x & 63)] = v;
+  c.dirty = true;
+}
+function getCell(x, y) {
+  const c = store.get((x >> 6) + "," + (y >> 6));
+  return c ? c.a[(y & 63) * CH + (x & 63)] : 0;
+}
+
+function visible() {
+  return [Math.max(0, Math.floor(ox / CH)), Math.max(0, Math.floor(oy / CH)),
+    Math.min(SIZE - 1, Math.floor((ox + W / z) / CH)), Math.min(SIZE - 1, Math.floor((oy + H / z) / CH))];
+}
+function draw() {
+  g.imageSmoothingEnabled = false;
+  g.fillStyle = "#f4f4f0";
+  g.fillRect(0, 0, W, H);
+  const [x0, y0, x1, y1] = visible();
+  for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++) {
+    const c = store.get(cx + "," + cy);
+    if (!c) continue;
+    if (c.dirty) paint(c);
+    g.drawImage(c.cv, (cx * CH - ox) * z, (cy * CH - oy) * z, CH * z, CH * z);
+  }
+  if (z >= 8) {
+    g.strokeStyle = "rgba(0,0,0,.08)";
+    g.beginPath();
+    for (let x = Math.ceil(ox); x <= ox + W / z; x++) { const s = (x - ox) * z; g.moveTo(s, 0); g.lineTo(s, H); }
+    for (let y = Math.ceil(oy); y <= oy + H / z; y++) { const s = (y - oy) * z; g.moveTo(0, s); g.lineTo(W, s); }
+    g.stroke();
+  }
+}
+function redraw() { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); }
+function fit() { W = cv.width = innerWidth; H = cv.height = innerHeight; draw(); want(); }
+addEventListener("resize", fit);
+
+function clamp() {
+  ox = Math.min(N - 5, Math.max(-W / z + 5, ox));
+  oy = Math.min(N - 5, Math.max(-H / z + 5, oy));
+}
+function zoomAt(sx, sy, f) {
+  const nz = Math.min(48, Math.max(2, z * f));
+  ox += sx / z - sx / nz; oy += sy / z - sy / nz; z = nz;
+  clamp(); redraw(); want();
+}
+
+// ---- loading what is on screen from the database ----
+function want() {
+  clearTimeout(askT);
+  askT = setTimeout(async () => {
+    const [x0, y0, x1, y1] = visible(), fresh = new Set();
+    for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++) {
+      const k = cx + "," + cy;
+      if (!asked.has(k)) { asked.add(k); fresh.add(k); }
+    }
+    if (!fresh.size) return;
+    const { data, error } = await sb.from("board_chunks").select("cx,cy,data")
+      .gte("cx", x0).lte("cx", x1).gte("cy", y0).lte("cy", y1);
+    if (error) { fresh.forEach(k => asked.delete(k)); setStatus("could not load board"); return; }
+    for (const r of data) {
+      if (!fresh.has(r.cx + "," + r.cy)) continue;
+      const c = chunk(r.cx, r.cy), b = atob(r.data);
+      for (let i = 0; i < b.length && i < CH * CH; i++) c.a[i] = b.charCodeAt(i);
+      c.dirty = true;
+    }
+    redraw();
+  }, 150);
+}
+
+// ---- live updates between everyone who has the page open ----
+room.on("broadcast", { event: "cells" }, ({ payload }) => {
+  if (!payload || !Array.isArray(payload.cells)) return;
+  for (const p of payload.cells) if (Array.isArray(p)) setCell(p[0] | 0, p[1] | 0, p[2] | 0);
+  redraw();
+}).subscribe(s => setStatus(s === "SUBSCRIBED" ? "online" : s === "TIMED_OUT" || s === "CHANNEL_ERROR" ? "live updates down" : "connecting"));
+
+setInterval(() => {
+  if (pending.length) room.send({ type: "broadcast", event: "cells", payload: { cells: pending.splice(0, 400) } });
+}, 100);
+
+// ---- saving: each drawer merges its own cells into the stored chunk ----
+let flushing = false;
+async function flush() {
+  if (flushing || !mine.size) return;
+  flushing = true;
+  const batch = [...mine]; mine.clear();
+  for (const [k, m] of batch) {
+    const [cx, cy] = k.split(",").map(Number);
+    try {
+      const { data } = await sb.from("board_chunks").select("data").eq("cx", cx).eq("cy", cy).maybeSingle();
+      const a = new Uint8Array(CH * CH);
+      if (data) { const b = atob(data.data); for (let i = 0; i < b.length && i < a.length; i++) a[i] = b.charCodeAt(i); }
+      for (const [i, v] of m) a[i] = v;
+      let s = ""; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+      const { error } = await sb.from("board_chunks").upsert({ cx, cy, data: btoa(s) });
+      if (error) throw error;
+    } catch (e) {
+      const cur = mine.get(k) || new Map();
+      for (const [i, v] of m) if (!cur.has(i)) cur.set(i, v);
+      mine.set(k, cur);
+      setStatus("save failed, retrying");
+    }
+  }
+  flushing = false;
+}
+setInterval(flush, 3000);
+addEventListener("visibilitychange", () => { if (document.hidden) flush(); });
+
+// ---- drawing ----
+function stamp(x, y) {
+  const v = tool === "eraser" ? 0 : color, o = brush >> 1;
+  for (let j = 0; j < brush; j++) for (let i = 0; i < brush; i++) {
+    const cx = x - o + i, cy = y - o + j;
+    if (cx < 0 || cy < 0 || cx >= N || cy >= N) continue;
+    setCell(cx, cy, v); pending.push([cx, cy, v]);
+    const k = (cx >> 6) + "," + (cy >> 6);
+    let m = mine.get(k); if (!m) mine.set(k, m = new Map());
+    m.set((cy & 63) * CH + (cx & 63), v);
+  }
+  redraw();
+}
+function line(a, b) {
+  let [x, y] = a;
+  const dx = Math.abs(b[0] - x), dy = -Math.abs(b[1] - y), sx = x < b[0] ? 1 : -1, sy = y < b[1] ? 1 : -1;
+  let err = dx + dy;
+  for (;;) {
+    stamp(x, y);
+    if (x === b[0] && y === b[1]) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x += sx; }
+    if (e2 <= dx) { err += dx; y += sy; }
+  }
+}
+const cell = e => [Math.floor(ox + e.clientX / z), Math.floor(oy + e.clientY / z)];
+
+cv.onpointerdown = e => {
+  cv.setPointerCapture(e.pointerId);
+  if (tool === "hand" || space || e.button === 1) { drag = { x: e.clientX, y: e.clientY, ox, oy }; return; }
+  const p = cell(e);
+  if (tool === "pick") { const v = getCell(p[0], p[1]); if (v) setColor(v); return; }
+  last = p; stamp(p[0], p[1]);
+};
+cv.onpointermove = e => {
+  const p = cell(e);
+  pos = p[0] + ", " + p[1] + "  zoom " + z.toFixed(1); showInfo();
+  if (drag) { ox = drag.ox - (e.clientX - drag.x) / z; oy = drag.oy - (e.clientY - drag.y) / z; clamp(); redraw(); want(); return; }
+  if (last) { line(last, p); last = p; }
+};
+cv.onpointerup = cv.onpointercancel = () => { drag = null; last = null; };
+cv.onwheel = e => { e.preventDefault(); zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.25 : 0.8); };
+addEventListener("keydown", e => { if (e.code === "Space" && !e.repeat) { space = true; e.preventDefault(); } });
+addEventListener("keyup", e => { if (e.code === "Space") space = false; });
+
+// ---- toolbar ----
+function setColor(v) {
+  color = v;
+  if (tool !== "pencil") setTool("pencil");
+  document.querySelectorAll(".sw").forEach(s => s.classList.toggle("on", +s.dataset.c === v));
+}
+function setTool(t) {
+  tool = t;
+  document.querySelectorAll("[data-tool]").forEach(b => b.classList.toggle("on", b.dataset.tool === t));
+}
+document.querySelectorAll("[data-tool]").forEach(b => b.onclick = () => setTool(b.dataset.tool));
+document.getElementById("brush").onchange = e => brush = +e.target.value;
+document.getElementById("zin").onclick = () => zoomAt(W / 2, H / 2, 1.5);
+document.getElementById("zout").onclick = () => zoomAt(W / 2, H / 2, 1 / 1.5);
+PAL.forEach((h, i) => {
+  if (!h) return;
+  const s = document.createElement("div");
+  s.className = "sw" + (i === color ? " on" : "");
+  s.style.background = h; s.dataset.c = i;
+  s.onclick = () => setColor(i);
+  document.getElementById("pal").appendChild(s);
+});
+
+fit();
+</script>
+</body>
+</html>
